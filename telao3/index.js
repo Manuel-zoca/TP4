@@ -64,7 +64,7 @@ async function syncAuthToSupabase() {
   for (const file of files) {
     try {
       const filePath = path.join(AUTH_FOLDER, file);
-      if (!fs.existsSync(filePath)) continue; // evita crash se arquivo sumiu
+      if (!fs.existsSync(filePath)) continue;
       const content = fs.readFileSync(filePath);
       await supabase.storage.from(BUCKET).upload(file, content, { upsert: true });
     } catch (err) {
@@ -78,7 +78,8 @@ async function syncAuthToSupabase() {
 async function iniciarBot(deviceName, authFolder) {
   console.log(`🟢 Iniciando o bot para o dispositivo: ${deviceName}...`);
 
-  await syncAuthFromSupabase(); // baixar sessão antes de iniciar
+  // 1️⃣ Baixa a sessão do Supabase antes de iniciar
+  await syncAuthFromSupabase();
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
   const { version } = await fetchLatestBaileysVersion();
@@ -199,6 +200,7 @@ async function iniciarBot(deviceName, authFolder) {
 // ===================== Inicialização =====================
 iniciarBot("Dispositivo 1", AUTH_FOLDER);
 
+// ===================== Servidor HTTP =====================
 const PORT = process.env.PORT || 3000;
 app.get("/", (_, res) => res.send("✅ TopBot rodando com sucesso!"));
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP ativo na porta ${PORT}`));
