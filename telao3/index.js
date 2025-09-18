@@ -32,6 +32,7 @@ const BUCKET = process.env.BUCKET_NAME || "whatsapp-auth";
 const AUTH_FOLDER = "./auth1";
 
 let pendingMessages = [];
+let authReady = false;
 
 // ===================== Funções de sincronização com Supabase =====================
 async function syncAuthFromSupabase() {
@@ -127,6 +128,7 @@ async function iniciarBot(deviceName, authFolder) {
       setTimeout(() => iniciarBot(deviceName, authFolder), 3000);
     } else if (connection === "open") {
       console.log(`✅ Bot conectado no dispositivo: ${deviceName}`);
+      authReady = true;
       await processPendingMessages();
     }
   });
@@ -136,11 +138,7 @@ async function iniciarBot(deviceName, authFolder) {
     await syncAuthToSupabase();
   });
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    if (!messages || !messages.length) return;
-    const msg = messages[0];
-    if (msg.key.fromMe) return;
-
+  const processMessage = async (msg) => {
     const senderJid = msg.key.remoteJid;
     let messageText = (
       msg.message?.conversation ||
@@ -173,6 +171,20 @@ async function iniciarBot(deviceName, authFolder) {
       console.error("❌ Erro ao processar mensagem:", err);
       pendingMessages.push({ jid: senderJid, msg: { text: "❌ Ocorreu um erro ao processar sua solicitação." } });
     }
+  };
+
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    if (!messages || !messages.length) return;
+    const msg = messages[0];
+    if (msg.key.fromMe) return;
+
+    if (!authReady) {
+      // Fila se auth não pronto
+      pendingMessages.push({ jid: msg.key.remoteJid, msg: { text: "⏳ Bot iniciando, sua mensagem será processada em breve." } });
+      return;
+    }
+
+    await processMessage(msg);
   });
 
   sock.ev.on("messages.reaction", async reactions => {
