@@ -30,15 +30,17 @@ const { handleCompra2 } = require("./handlers/compra2Handler");
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const BUCKET = process.env.BUCKET_NAME || "whatsapp-auth";
 const AUTH_FOLDER = "./auth1";
+const STORE_FOLDER = "./baileys_store"; // 🆕 Diretório para sessões Signal
 
 let pendingMessages = [];
 let authReady = false;
 
 // ===================== Funções de sincronização com Supabase =====================
+
 async function syncAuthFromSupabase() {
   if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER);
 
-  console.log("🔄 Listando arquivos de sessão no Supabase...");
+  console.log("🔄 Listando arquivos de autenticação no Supabase...");
   const { data, error } = await supabase.storage.from(BUCKET).list("", { limit: 100 });
   if (error) {
     console.error("❌ Erro ao listar Supabase:", error.message);
@@ -46,11 +48,11 @@ async function syncAuthFromSupabase() {
   }
 
   if (!data || data.length === 0) {
-    console.log("ℹ️ Nenhum arquivo de sessão encontrado no Supabase.");
+    console.log("ℹ️ Nenhum arquivo de autenticação encontrado no Supabase.");
     return;
   }
 
-  console.log(`ℹ️ Encontrados ${data.length} arquivos de sessão. Iniciando download...`);
+  console.log(`ℹ️ Encontrados ${data.length} arquivos. Iniciando download...`);
 
   for (let i = 0; i < data.length; i++) {
     const file = data[i];
@@ -69,7 +71,44 @@ async function syncAuthFromSupabase() {
     }
   }
 
-  console.log("✅ Todos os arquivos de sessão foram carregados do Supabase.");
+  console.log("✅ Todos os arquivos de autenticação foram carregados do Supabase.");
+}
+
+async function syncStoreFromSupabase() {
+  if (!fs.existsSync(STORE_FOLDER)) fs.mkdirSync(STORE_FOLDER, { recursive: true });
+
+  console.log("🔄 Listando arquivos de STORE (sessões Signal) no Supabase...");
+  const { data, error } = await supabase.storage.from(BUCKET).list("store/", { limit: 100 });
+  if (error) {
+    console.error("❌ Erro ao listar STORE no Supabase:", error.message);
+    return;
+  }
+
+  if (!data || data.length === 0) {
+    console.log("ℹ️ Nenhum arquivo de STORE encontrado no Supabase.");
+    return;
+  }
+
+  console.log(`ℹ️ Encontrados ${data.length} arquivos de STORE. Iniciando download...`);
+
+  for (let i = 0; i < data.length; i++) {
+    const file = data[i];
+    try {
+      const filePath = path.join(STORE_FOLDER, file.name);
+      const { data: fileData, error: downloadErr } = await supabase.storage.from(BUCKET).download(`store/${file.name}`);
+      if (downloadErr) throw downloadErr;
+
+      const buffer = Buffer.from(await fileData.arrayBuffer());
+      fs.writeFileSync(filePath, buffer);
+
+      const sizeKB = (buffer.length / 1024).toFixed(2);
+      console.log(`📥 [${i + 1}/${data.length}] Baixado STORE: ${file.name} → ${sizeKB} KB`);
+    } catch (err) {
+      console.error("❌ Erro ao baixar STORE", file.name, ":", err.message);
+    }
+  }
+
+  console.log("✅ Todos os arquivos de STORE foram carregados do Supabase.");
 }
 
 // Upload para Supabase
@@ -84,21 +123,43 @@ async function syncAuthToSupabase() {
       const content = fs.readFileSync(filePath);
       await supabase.storage.from(BUCKET).upload(file, content, { upsert: true });
     } catch (err) {
-      console.error("❌ Erro ao enviar arquivo para Supabase:", file, err.message);
+      console.error("❌ Erro ao enviar autenticação para Supabase:", file, err.message);
     }
   }
-  console.log("☁️ Sessão enviada para Supabase.");
+  console.log("☁️ Autenticação enviada para Supabase.");
+}
+
+async function syncStoreToSupabase() {
+  if (!fs.existsSync(STORE_FOLDER)) return;
+
+  const files = fs.readdirSync(STORE_FOLDER);
+  for (const file of files) {
+    try {
+      const filePath = path.join(STORE_FOLDER, file);
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath);
+      await supabase.storage.from(BUCKET).upload(`store/${file}`, content, { upsert: true });
+    } catch (err) {
+      console.error("❌ Erro ao enviar STORE para Supabase:", file, err.message);
+    }
+  }
+  console.log("☁️ STORE (sessões Signal) enviado para Supabase.");
 }
 
 // ===================== Bot =====================
 async function iniciarBot(deviceName, authFolder) {
   console.log(`🟢 Iniciando o bot para o dispositivo: ${deviceName}...`);
 
-  // 1️⃣ Baixa a sessão do Supabase antes de iniciar
+  // 1️⃣ Baixa a autenticação E o store do Supabase antes de iniciar
   await syncAuthFromSupabase();
+  await syncStoreFromSupabase();
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
   const { version } = await fetchLatestBaileysVersion();
+
+  // 🆕 Estruturas necessárias para persistência de mensagens e sessões
+  const msgRetryCounterMap = {};
+  const msgRetryCounterCache = {};
 
   const sock = makeWASocket({
     version,
@@ -107,12 +168,23 @@ async function iniciarBot(deviceName, authFolder) {
     qrTimeout: 60_000,
     connectTimeoutMs: 60_000,
     keepAliveIntervalMs: 30_000,
+    // 🆕 Configurações essenciais para estabilidade
+    msgRetryCounterMap,
+    msgRetryCounterCache,
+    generateHighQualityLinkPreview: true,
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
+    getMessage: async (key) => {
+      return { conversation: "placeholder" }; // necessário para retry de mensagens
+    }
   });
 
   const processPendingMessages = async () => {
     for (const { jid, msg } of pendingMessages) {
-      try { await sock.sendMessage(jid, msg); } 
-      catch (e) { console.error("❌ Falha ao reenviar mensagem pendente:", e.message); }
+      try {
+        await sock.sendMessage(jid, msg);
+      } catch (e) {
+        console.error("❌ Falha ao reenviar mensagem pendente:", e.message);
+      }
     }
     pendingMessages = [];
   };
@@ -145,13 +217,24 @@ async function iniciarBot(deviceName, authFolder) {
       console.log(`✅ Bot conectado no dispositivo: ${deviceName}`);
       authReady = true;
       await processPendingMessages();
+
+      // 🆕 Sincroniza o STORE logo após conexão bem-sucedida
+      await syncStoreToSupabase();
     }
   });
 
+  // 🆕 Salva CREDENCIAIS E STORE sempre que atualizar
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     await syncAuthToSupabase();
+    await syncStoreToSupabase();
   });
+
+  // 🆕 Sincroniza STORE periodicamente (a cada 5 minutos) para evitar perda
+  setInterval(async () => {
+    await syncStoreToSupabase();
+    console.log("💾 STORE sincronizado periodicamente com Supabase.");
+  }, 5 * 60 * 1000); // 5 minutos
 
   const processMessage = async (msg) => {
     const senderJid = msg.key.remoteJid;
