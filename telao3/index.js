@@ -38,26 +38,41 @@ let authReady = false;
 async function syncAuthFromSupabase() {
   if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER);
 
+  console.log("🔄 Listando arquivos de sessão no Supabase...");
   const { data, error } = await supabase.storage.from(BUCKET).list("", { limit: 100 });
   if (error) {
     console.error("❌ Erro ao listar Supabase:", error.message);
     return;
   }
 
-  for (const file of data) {
+  if (!data || data.length === 0) {
+    console.log("ℹ️ Nenhum arquivo de sessão encontrado no Supabase.");
+    return;
+  }
+
+  console.log(`ℹ️ Encontrados ${data.length} arquivos de sessão. Iniciando download...`);
+
+  for (let i = 0; i < data.length; i++) {
+    const file = data[i];
     try {
       const { data: fileData, error: downloadErr } = await supabase.storage.from(BUCKET).download(file.name);
       if (downloadErr) throw downloadErr;
 
       const buffer = Buffer.from(await fileData.arrayBuffer());
       fs.writeFileSync(path.join(AUTH_FOLDER, file.name), buffer);
+
+      const sizeKB = (buffer.length / 1024).toFixed(2);
+      const sizeMB = (buffer.length / (1024 * 1024)).toFixed(2);
+      console.log(`📥 [${i + 1}/${data.length}] Baixado: ${file.name} → ${sizeKB} KB (${sizeMB} MB)`);
     } catch (err) {
       console.error("❌ Erro ao baixar", file.name, ":", err.message);
     }
   }
-  console.log("✅ Sessão carregada do Supabase para local.");
+
+  console.log("✅ Todos os arquivos de sessão foram carregados do Supabase.");
 }
 
+// Upload para Supabase
 async function syncAuthToSupabase() {
   if (!fs.existsSync(AUTH_FOLDER)) return;
 
@@ -179,7 +194,6 @@ async function iniciarBot(deviceName, authFolder) {
     if (msg.key.fromMe) return;
 
     if (!authReady) {
-      // Fila se auth não pronto
       pendingMessages.push({ jid: msg.key.remoteJid, msg: { text: "⏳ Bot iniciando, sua mensagem será processada em breve." } });
       return;
     }
