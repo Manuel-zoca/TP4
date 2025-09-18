@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+const { makeWASocket, useSingleFileLegacyAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const { Boom } = require("@hapi/boom");
 const express = require("express");
@@ -9,7 +9,7 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// Handlers
+// Handlers (mantidos como estão)
 const { handleMessage } = require("./handlers/messageHandler");
 const { handleConcorrer } = require("./handlers/concorrerHandler");
 const { handleListar } = require("./handlers/listarHandler");
@@ -29,152 +29,71 @@ const { handleCompra2 } = require("./handlers/compra2Handler");
 // Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const BUCKET = process.env.BUCKET_NAME || "whatsapp-auth";
-const AUTH_FOLDER = "./auth1";
-const STORE_FOLDER = "./baileys_store"; // 🆕 Diretório para sessões Signal
+const AUTH_FILE = "./auth_info_legacy.json"; // 🆕 Só 1 arquivo no modo Legacy
 
 let pendingMessages = [];
 let authReady = false;
+let qrSent = false;
 
 // ===================== Funções de sincronização com Supabase =====================
 
 async function syncAuthFromSupabase() {
-  if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER);
+  console.log("🔄 Verificando sessão salva no Supabase...");
 
-  console.log("🔄 Listando arquivos de autenticação no Supabase...");
-  const { data, error } = await supabase.storage.from(BUCKET).list("", { limit: 100 });
-  if (error) {
-    console.error("❌ Erro ao listar Supabase:", error.message);
-    return;
+  try {
+    const { data, error } = await supabase.storage.from(BUCKET).download("auth_info_legacy.json");
+    if (error) throw error;
+
+    const buffer = Buffer.from(await data.arrayBuffer());
+    fs.writeFileSync(AUTH_FILE, buffer);
+    console.log("✅ Sessão carregada do Supabase. Não será necessário QR.");
+    return true;
+  } catch (err) {
+    console.log("ℹ️ Nenhuma sessão encontrada no Supabase. Será necessário escanear o QR.");
+    if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE); // remove local se corrompido
+    return false;
   }
-
-  if (!data || data.length === 0) {
-    console.log("ℹ️ Nenhum arquivo de autenticação encontrado no Supabase.");
-    return;
-  }
-
-  console.log(`ℹ️ Encontrados ${data.length} arquivos. Iniciando download...`);
-
-  for (let i = 0; i < data.length; i++) {
-    const file = data[i];
-    try {
-      const { data: fileData, error: downloadErr } = await supabase.storage.from(BUCKET).download(file.name);
-      if (downloadErr) throw downloadErr;
-
-      const buffer = Buffer.from(await fileData.arrayBuffer());
-      fs.writeFileSync(path.join(AUTH_FOLDER, file.name), buffer);
-
-      const sizeKB = (buffer.length / 1024).toFixed(2);
-      const sizeMB = (buffer.length / (1024 * 1024)).toFixed(2);
-      console.log(`📥 [${i + 1}/${data.length}] Baixado: ${file.name} → ${sizeKB} KB (${sizeMB} MB)`);
-    } catch (err) {
-      console.error("❌ Erro ao baixar", file.name, ":", err.message);
-    }
-  }
-
-  console.log("✅ Todos os arquivos de autenticação foram carregados do Supabase.");
 }
 
-async function syncStoreFromSupabase() {
-  if (!fs.existsSync(STORE_FOLDER)) fs.mkdirSync(STORE_FOLDER, { recursive: true });
-
-  console.log("🔄 Listando arquivos de STORE (sessões Signal) no Supabase...");
-  const { data, error } = await supabase.storage.from(BUCKET).list("store/", { limit: 100 });
-  if (error) {
-    console.error("❌ Erro ao listar STORE no Supabase:", error.message);
-    return;
-  }
-
-  if (!data || data.length === 0) {
-    console.log("ℹ️ Nenhum arquivo de STORE encontrado no Supabase.");
-    return;
-  }
-
-  console.log(`ℹ️ Encontrados ${data.length} arquivos de STORE. Iniciando download...`);
-
-  for (let i = 0; i < data.length; i++) {
-    const file = data[i];
-    try {
-      const filePath = path.join(STORE_FOLDER, file.name);
-      const { data: fileData, error: downloadErr } = await supabase.storage.from(BUCKET).download(`store/${file.name}`);
-      if (downloadErr) throw downloadErr;
-
-      const buffer = Buffer.from(await fileData.arrayBuffer());
-      fs.writeFileSync(filePath, buffer);
-
-      const sizeKB = (buffer.length / 1024).toFixed(2);
-      console.log(`📥 [${i + 1}/${data.length}] Baixado STORE: ${file.name} → ${sizeKB} KB`);
-    } catch (err) {
-      console.error("❌ Erro ao baixar STORE", file.name, ":", err.message);
-    }
-  }
-
-  console.log("✅ Todos os arquivos de STORE foram carregados do Supabase.");
-}
-
-// Upload para Supabase
 async function syncAuthToSupabase() {
-  if (!fs.existsSync(AUTH_FOLDER)) return;
-
-  const files = fs.readdirSync(AUTH_FOLDER);
-  for (const file of files) {
-    try {
-      const filePath = path.join(AUTH_FOLDER, file);
-      if (!fs.existsSync(filePath)) continue;
-      const content = fs.readFileSync(filePath);
-      await supabase.storage.from(BUCKET).upload(file, content, { upsert: true });
-    } catch (err) {
-      console.error("❌ Erro ao enviar autenticação para Supabase:", file, err.message);
-    }
+  if (!fs.existsSync(AUTH_FILE)) {
+    console.log("❌ Arquivo de autenticação não existe. Não foi possível salvar.");
+    return;
   }
-  console.log("☁️ Autenticação enviada para Supabase.");
-}
 
-async function syncStoreToSupabase() {
-  if (!fs.existsSync(STORE_FOLDER)) return;
-
-  const files = fs.readdirSync(STORE_FOLDER);
-  for (const file of files) {
-    try {
-      const filePath = path.join(STORE_FOLDER, file);
-      if (!fs.existsSync(filePath)) continue;
-      const content = fs.readFileSync(filePath);
-      await supabase.storage.from(BUCKET).upload(`store/${file}`, content, { upsert: true });
-    } catch (err) {
-      console.error("❌ Erro ao enviar STORE para Supabase:", file, err.message);
-    }
+  try {
+    const content = fs.readFileSync(AUTH_FILE);
+    await supabase.storage.from(BUCKET).upload("auth_info_legacy.json", content, { upsert: true });
+    console.log("☁️ Sessão salva com sucesso no Supabase.");
+  } catch (err) {
+    console.error("❌ Erro ao enviar sessão para Supabase:", err.message);
   }
-  console.log("☁️ STORE (sessões Signal) enviado para Supabase.");
 }
 
 // ===================== Bot =====================
-async function iniciarBot(deviceName, authFolder) {
-  console.log(`🟢 Iniciando o bot para o dispositivo: ${deviceName}...`);
+async function iniciarBot(deviceName) {
+  console.log(`🟢 Iniciando o bot no modo LEGACY (WhatsApp Web) para: ${deviceName}...`);
 
-  // 1️⃣ Baixa a autenticação E o store do Supabase antes de iniciar
-  await syncAuthFromSupabase();
-  await syncStoreFromSupabase();
+  // 1️⃣ Tenta carregar sessão do Supabase
+  const hasSession = await syncAuthFromSupabase();
+  qrSent = false;
 
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+  // 2️⃣ Configura autenticação
+  const { state, saveCreds } = await useSingleFileLegacyAuthState(AUTH_FILE);
+
   const { version } = await fetchLatestBaileysVersion();
-
-  // 🆕 Estruturas necessárias para persistência de mensagens e sessões
-  const msgRetryCounterMap = {};
-  const msgRetryCounterCache = {};
 
   const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    qrTimeout: 60_000,
-    connectTimeoutMs: 60_000,
-    keepAliveIntervalMs: 30_000,
-    // 🆕 Configurações essenciais para estabilidade
-    msgRetryCounterMap,
-    msgRetryCounterCache,
-    generateHighQualityLinkPreview: true,
     browser: ["Ubuntu", "Chrome", "20.0.04"],
+    legacy: true, // ✅ MODO LEGACY ATIVADO
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: true,
     getMessage: async (key) => {
-      return { conversation: "placeholder" }; // necessário para retry de mensagens
+      return { conversation: "placeholder" };
     }
   });
 
@@ -192,13 +111,15 @@ async function iniciarBot(deviceName, authFolder) {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    if (qr && !qrSent) {
+      qrSent = true;
       try {
         const qrBase64 = await QRCode.toDataURL(qr);
-        console.log(`📌 Escaneie o QR Code do dispositivo: ${deviceName}`);
+        console.log(`\n\n📌 QR CODE PARA CONECTAR (escaneie nos próximos 30s):\n`);
         console.log(qrBase64.split(",")[1]);
+        console.log("\n");
       } catch (err) {
-        console.error("❌ Erro ao gerar QR Code base64:", err);
+        console.error("❌ Erro ao gerar QR Code:", err);
       }
     }
 
@@ -207,34 +128,26 @@ async function iniciarBot(deviceName, authFolder) {
       console.error(`⚠️ Conexão fechada: ${motivo}`);
 
       if (motivo === DisconnectReason.loggedOut) {
-        console.log("❌ Bot deslogado. Encerrando...");
-        process.exit(0);
+        console.log("❌ Sessão inválida. Limpando e pedindo novo QR...");
+        if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
+        setTimeout(() => iniciarBot(deviceName), 3000);
+      } else {
+        console.log("🔄 Reconectando...");
+        setTimeout(() => iniciarBot(deviceName), 5000);
       }
-
-      console.log("🔄 Tentando reconectar...");
-      setTimeout(() => iniciarBot(deviceName, authFolder), 3000);
     } else if (connection === "open") {
-      console.log(`✅ Bot conectado no dispositivo: ${deviceName}`);
+      console.log(`✅✅✅ BOT CONECTADO COM SUCESSO NO MODO LEGACY!`);
+      console.log(`✅ Grupos antigos DEVEM funcionar normalmente.`);
       authReady = true;
       await processPendingMessages();
-
-      // 🆕 Sincroniza o STORE logo após conexão bem-sucedida
-      await syncStoreToSupabase();
+      await syncAuthToSupabase(); // salva sessão logo após conectar
     }
   });
 
-  // 🆕 Salva CREDENCIAIS E STORE sempre que atualizar
   sock.ev.on("creds.update", async () => {
     await saveCreds();
     await syncAuthToSupabase();
-    await syncStoreToSupabase();
   });
-
-  // 🆕 Sincroniza STORE periodicamente (a cada 5 minutos) para evitar perda
-  setInterval(async () => {
-    await syncStoreToSupabase();
-    console.log("💾 STORE sincronizado periodicamente com Supabase.");
-  }, 5 * 60 * 1000); // 5 minutos
 
   const processMessage = async (msg) => {
     const senderJid = msg.key.remoteJid;
@@ -277,7 +190,7 @@ async function iniciarBot(deviceName, authFolder) {
     if (msg.key.fromMe) return;
 
     if (!authReady) {
-      pendingMessages.push({ jid: msg.key.remoteJid, msg: { text: "⏳ Bot iniciando, sua mensagem será processada em breve." } });
+      pendingMessages.push({ jid: msg.key.remoteJid, msg: { text: "⏳ Bot iniciando, aguarde..." } });
       return;
     }
 
@@ -307,9 +220,9 @@ async function iniciarBot(deviceName, authFolder) {
 }
 
 // ===================== Inicialização =====================
-iniciarBot("Dispositivo 1", AUTH_FOLDER);
+iniciarBot("Dispositivo 1");
 
 // ===================== Servidor HTTP =====================
 const PORT = process.env.PORT || 3000;
-app.get("/", (_, res) => res.send("✅ TopBot rodando com sucesso!"));
+app.get("/", (_, res) => res.send("✅ TopBot LEGACY rodando com sucesso!"));
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP ativo na porta ${PORT}`));
