@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { makeWASocket, useSingleFileLegacyAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const { Boom } = require("@hapi/boom");
 const express = require("express");
@@ -9,7 +9,7 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// Handlers (mantidos como estão)
+// Handlers
 const { handleMessage } = require("./handlers/messageHandler");
 const { handleConcorrer } = require("./handlers/concorrerHandler");
 const { handleListar } = require("./handlers/listarHandler");
@@ -29,7 +29,7 @@ const { handleCompra2 } = require("./handlers/compra2Handler");
 // Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const BUCKET = process.env.BUCKET_NAME || "whatsapp-auth";
-const AUTH_FILE = "./auth_info_legacy.json"; // 🆕 Só 1 arquivo no modo Legacy
+const AUTH_FOLDER = "./auth_info_baileys";
 
 let pendingMessages = [];
 let authReady = false;
@@ -40,55 +40,77 @@ let qrSent = false;
 async function syncAuthFromSupabase() {
   console.log("🔄 Verificando sessão salva no Supabase...");
 
+  if (!fs.existsSync(AUTH_FOLDER)) {
+    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+  }
+
   try {
-    const { data, error } = await supabase.storage.from(BUCKET).download("auth_info_legacy.json");
+    const { data, error } = await supabase.storage.from(BUCKET).list("", { limit: 100 });
     if (error) throw error;
 
-    const buffer = Buffer.from(await data.arrayBuffer());
-    fs.writeFileSync(AUTH_FILE, buffer);
+    if (!data || data.length === 0) {
+      console.log("ℹ️ Nenhuma sessão encontrada no Supabase. Será necessário escanear o QR.");
+      return false;
+    }
+
+    console.log(`📥 Baixando ${data.length} arquivos de sessão...`);
+    for (const file of data) {
+      const { data: fileData, error: downloadErr } = await supabase.storage.from(BUCKET).download(file.name);
+      if (downloadErr) throw downloadErr;
+      const buffer = Buffer.from(await fileData.arrayBuffer());
+      fs.writeFileSync(path.join(AUTH_FOLDER, file.name), buffer);
+    }
+
     console.log("✅ Sessão carregada do Supabase. Não será necessário QR.");
     return true;
   } catch (err) {
-    console.log("ℹ️ Nenhuma sessão encontrada no Supabase. Será necessário escanear o QR.");
-    if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE); // remove local se corrompido
+    console.log("ℹ️ Nenhuma sessão válida encontrada. Será necessário escanear o QR.");
+    // Limpa pasta local se corrompida
+    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    fs.mkdirSync(AUTH_FOLDER, { recursive: true });
     return false;
   }
 }
 
 async function syncAuthToSupabase() {
-  if (!fs.existsSync(AUTH_FILE)) {
-    console.log("❌ Arquivo de autenticação não existe. Não foi possível salvar.");
-    return;
-  }
+  if (!fs.existsSync(AUTH_FOLDER)) return;
 
-  try {
-    const content = fs.readFileSync(AUTH_FILE);
-    await supabase.storage.from(BUCKET).upload("auth_info_legacy.json", content, { upsert: true });
-    console.log("☁️ Sessão salva com sucesso no Supabase.");
-  } catch (err) {
-    console.error("❌ Erro ao enviar sessão para Supabase:", err.message);
+  const files = fs.readdirSync(AUTH_FOLDER);
+  console.log(`☁️ Enviando ${files.length} arquivos de sessão para o Supabase...`);
+
+  for (const file of files) {
+    try {
+      const filePath = path.join(AUTH_FOLDER, file);
+      const content = fs.readFileSync(filePath);
+      await supabase.storage.from(BUCKET).upload(file, content, { upsert: true });
+    } catch (err) {
+      console.error(`❌ Erro ao enviar ${file}:`, err.message);
+    }
   }
+  console.log("✅ Sessão salva com sucesso no Supabase.");
 }
 
 // ===================== Bot =====================
 async function iniciarBot(deviceName) {
-  console.log(`🟢 Iniciando o bot no modo LEGACY (WhatsApp Web) para: ${deviceName}...`);
+  console.log(`🟢 Iniciando o bot no modo MULTI-DEVICE para: ${deviceName}...`);
 
   // 1️⃣ Tenta carregar sessão do Supabase
   const hasSession = await syncAuthFromSupabase();
   qrSent = false;
 
   // 2️⃣ Configura autenticação
-  const { state, saveCreds } = await useSingleFileLegacyAuthState(AUTH_FILE);
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, saveCreds) // ✅ ESSENCIAL para evitar "No sessions"
+    },
     printQRInTerminal: false,
     browser: ["Ubuntu", "Chrome", "20.0.04"],
-    legacy: true, // ✅ MODO LEGACY ATIVADO
     syncFullHistory: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: true,
@@ -129,14 +151,14 @@ async function iniciarBot(deviceName) {
 
       if (motivo === DisconnectReason.loggedOut) {
         console.log("❌ Sessão inválida. Limpando e pedindo novo QR...");
-        if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
+        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         setTimeout(() => iniciarBot(deviceName), 3000);
       } else {
         console.log("🔄 Reconectando...");
         setTimeout(() => iniciarBot(deviceName), 5000);
       }
     } else if (connection === "open") {
-      console.log(`✅✅✅ BOT CONECTADO COM SUCESSO NO MODO LEGACY!`);
+      console.log(`✅✅✅ BOT CONECTADO COM SUCESSO!`);
       console.log(`✅ Grupos antigos DEVEM funcionar normalmente.`);
       authReady = true;
       await processPendingMessages();
@@ -148,6 +170,21 @@ async function iniciarBot(deviceName) {
     await saveCreds();
     await syncAuthToSupabase();
   });
+
+  // 🆕 Garante SenderKey para grupos antes de enviar
+  const ensureGroupReady = async (groupId) => {
+    if (!groupId.endsWith("@g.us")) return true;
+
+    try {
+      // Tenta enviar uma mensagem invisível para forçar SenderKey
+      await sock.sendMessage(groupId, { text: "✅" }, { ephemeralExpiration: 1 });
+      console.log(`🔑 SenderKey garantida para ${groupId}`);
+      return true;
+    } catch (err) {
+      console.warn(`⚠️ Falha ao garantir SenderKey para ${groupId}:`, err.message);
+      return false;
+    }
+  };
 
   const processMessage = async (msg) => {
     const senderJid = msg.key.remoteJid;
@@ -163,6 +200,15 @@ async function iniciarBot(deviceName) {
     try {
       if (msg.message?.imageMessage && senderJid.endsWith("@g.us")) await handleComprovanteFoto(sock, msg);
       await handleMensagemPix(sock, msg);
+
+      // Se for grupo, garante SenderKey ANTES de processar comando
+      if (senderJid.endsWith("@g.us")) {
+        const ready = await ensureGroupReady(senderJid);
+        if (!ready) {
+          await sock.sendMessage(senderJid, { text: "⏳ Inicializando permissões do grupo... Tente novamente em 5s." });
+          return;
+        }
+      }
 
       // Comandos
       if (lowerText.startsWith(".compra")) await handleCompra2(sock, msg);
@@ -223,6 +269,6 @@ async function iniciarBot(deviceName) {
 iniciarBot("Dispositivo 1");
 
 // ===================== Servidor HTTP =====================
-const PORT = process.env.PORT || 3000;
-app.get("/", (_, res) => res.send("✅ TopBot LEGACY rodando com sucesso!"));
+const PORT = process.env.PORT || 10000; // Render usa 10000 por padrão
+app.get("/", (_, res) => res.send("✅ TopBot MULTI-DEVICE rodando com sucesso!"));
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP ativo na porta ${PORT}`));
