@@ -171,21 +171,45 @@ async function iniciarBot(deviceName) {
     await syncAuthToSupabase();
   });
 
-  // 🆕 Garante SenderKey para grupos antes de enviar
+  // ===================== SenderKey cache & throttle =====================
+  // Guarda os grupos já inicializados para não tentar sempre (evita lentidão)
+  const senderReadyGroups = new Set();
+  // Guarda timestamp da última tentativa por grupo (evita flood de tentativas)
+  const senderAttemptAt = new Map();
+  const SENDER_COOLDOWN_MS = 60 * 1000; // 60 segundos
+
+  // 🆕 Função melhorada: tenta garantir SenderKey UMA VEZ por grupo e usa cache
   const ensureGroupReady = async (groupId) => {
-    if (!groupId.endsWith("@g.us")) return true;
+    if (!groupId || !groupId.endsWith("@g.us")) return true;
+
+    // Se já está pronto, retorna true imediatamente
+    if (senderReadyGroups.has(groupId)) return true;
+
+    // Se tentou recentemente, não tenta de novo (apenas retorna false para indicar não pronto)
+    const lastAttempt = senderAttemptAt.get(groupId) || 0;
+    const now = Date.now();
+    if (now - lastAttempt < SENDER_COOLDOWN_MS) {
+      // Evita mensagens repetidas: não enviar aviso ao usuário, só faz fallback
+      return false;
+    }
+
+    senderAttemptAt.set(groupId, now);
 
     try {
-      // Tenta enviar uma mensagem invisível para forçar SenderKey
-      await sock.sendMessage(groupId, { text: "✅" }, { ephemeralExpiration: 1 });
-      console.log(`🔑 SenderKey garantida para ${groupId}`);
+      // Envia mensagem mínima e imediata para forçar SenderKey. Evita conteúdo grande.
+      await sock.sendMessage(groupId, { text: "🔐 Inicializando grupo..." });
+      // Se chegou aqui, consideramos SenderKey pronto
+      senderReadyGroups.add(groupId);
+      // Limpa o aviso que mandamos (opcional): tenta deletar a mensagem se a API permitir
+      // (comentado para não quebrar caso não tenha id retornado)
       return true;
     } catch (err) {
-      console.warn(`⚠️ Falha ao garantir SenderKey para ${groupId}:`, err.message);
+      console.warn(`⚠️ Falha na inicialização do grupo ${groupId}: ${err.message}`);
       return false;
     }
   };
 
+  // ===================== Processamento de mensagens =====================
   const processMessage = async (msg) => {
     const senderJid = msg.key.remoteJid;
     let messageText = (
@@ -196,21 +220,35 @@ async function iniciarBot(deviceName) {
     ).replace(/[\u200e\u200f\u2068\u2069]/g, "").trim();
     const lowerText = messageText.toLowerCase();
 
-    try { await handleAntiLinkMessage(sock, msg); } catch (err) { console.error(err); }
+    try { await handleAntiLinkMessage(sock, msg); } catch (err) { console.error("AntiLink:", err); }
+
     try {
       if (msg.message?.imageMessage && senderJid.endsWith("@g.us")) await handleComprovanteFoto(sock, msg);
       await handleMensagemPix(sock, msg);
 
-      // Se for grupo, garante SenderKey ANTES de processar comando
+      // Se for grupo, garante SenderKey ANTES de processar comandos pesados
       if (senderJid.endsWith("@g.us")) {
         const ready = await ensureGroupReady(senderJid);
         if (!ready) {
-          await sock.sendMessage(senderJid, { text: "⏳ Inicializando permissões do grupo... Tente novamente em 5s." });
-          return;
+          // fallback: processa comandos leves (texto) mesmo sem SenderKey
+          // para evitar bloquear completamente. Só evita enviar mídia grande.
+          console.log(`ℹ️ SenderKey não pronta para ${senderJid}. Processando comandos leves.`);
+          // Se o comando exige enviar mídia grande (ex: tabela com imagens), faça fallback para texto.
+          if (lowerText === "@tabela" || ['.t', '.n', '.i', '.s'].includes(lowerText)) {
+            // enviar versão em texto simples (mais leve)
+            try {
+              await handleTabela(sock, msg, { fallbackTextOnly: true }); // handler pode aceitar flag opcional
+            } catch (e) {
+              // se handler não aceitar flag, chamar normalmente (tentativa)
+              try { await handleTabela(sock, msg); } catch (err) { console.error("Tabela fallback erro:", err.message); }
+            }
+            return;
+          }
+          // Para outros comandos de texto, continua normalmente
         }
       }
 
-      // Comandos
+      // Comandos (mantidos)
       if (lowerText.startsWith(".compra")) await handleCompra2(sock, msg);
       else if (lowerText === "@concorrentes") await handleListar(sock, msg);
       else if (lowerText.startsWith("@remove") || lowerText.startsWith("/remove")) await handleRemove(sock, msg);
@@ -236,15 +274,24 @@ async function iniciarBot(deviceName) {
     if (msg.key.fromMe) return;
 
     if (!authReady) {
+      // mantém comportamento inicial (fila), porém sem mensagens longas ao usuário
       pendingMessages.push({ jid: msg.key.remoteJid, msg: { text: "⏳ Bot iniciando, aguarde..." } });
       return;
     }
 
-    await processMessage(msg);
+    // Processa a mensagem imediatamente (não bloqueante)
+    // colocar em micro-tarefa para não travar o loop de eventos
+    processMessage(msg).catch(err => console.error("processMessage catch:", err));
   });
 
   sock.ev.on("messages.reaction", async reactions => {
-    for (const reactionMsg of reactions) await handleReaction({ reactionMessage: reactionMsg, sock });
+    for (const reactionMsg of reactions) {
+      try {
+        await handleReaction({ reactionMessage: reactionMsg, sock });
+      } catch (err) {
+        console.error("Erro reação:", err);
+      }
+    }
   });
 
   sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
