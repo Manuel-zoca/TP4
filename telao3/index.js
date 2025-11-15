@@ -34,6 +34,10 @@ const AUTH_FOLDER = "./auth_info_baileys";
 let pendingMessages = [];
 let authReady = false;
 let qrSent = false;
+let sock = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY = 5000;
 
 // ===================== Funções de sincronização com Supabase =====================
 
@@ -66,7 +70,9 @@ async function syncAuthFromSupabase() {
   } catch (err) {
     console.log("ℹ️ Nenhuma sessão válida encontrada. Será necessário escanear o QR.");
     // Limpa pasta local se corrompida
-    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    if (fs.existsSync(AUTH_FOLDER)) {
+      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    }
     fs.mkdirSync(AUTH_FOLDER, { recursive: true });
     return false;
   }
@@ -90,9 +96,39 @@ async function syncAuthToSupabase() {
   console.log("✅ Sessão salva com sucesso no Supabase.");
 }
 
+// ===================== Health Check e Keep Alive =====================
+function setupHealthChecks() {
+  // Health check endpoint
+  app.get("/health", (_, res) => {
+    const status = authReady ? "connected" : "disconnected";
+    res.json({ 
+      status, 
+      reconnectionAttempts: reconnectAttempts,
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  // Keep alive ping every 5 minutes
+  setInterval(() => {
+    if (sock && authReady) {
+      try {
+        // Envia um ping para manter a conexão ativa
+        sock.ev.emit("connection.update", { connection: "ping" });
+      } catch (error) {
+        console.log("🔄 Ping de manutenção...");
+      }
+    }
+  }, 5 * 60 * 1000);
+}
+
 // ===================== Bot =====================
 async function iniciarBot(deviceName) {
   console.log(`🟢 Iniciando o bot no modo MULTI-DEVICE para: ${deviceName}...`);
+  
+  // Limpa tentativas anteriores se for uma reconexão bem-sucedida
+  if (authReady) {
+    reconnectAttempts = 0;
+  }
 
   // 1️⃣ Tenta carregar sessão do Supabase
   const hasSession = await syncAuthFromSupabase();
@@ -103,31 +139,39 @@ async function iniciarBot(deviceName) {
 
   const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
+  sock = makeWASocket({
     version,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, saveCreds) // ✅ ESSENCIAL para evitar "No sessions"
+      keys: makeCacheableSignalKeyStore(state.keys, saveCreds)
     },
     printQRInTerminal: false,
     browser: ["Ubuntu", "Chrome", "20.0.04"],
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true, // Mantém online
     generateHighQualityLinkPreview: true,
     getMessage: async (key) => {
       return { conversation: "placeholder" };
-    }
+    },
+    // Configurações adicionais para estabilidade
+    retryRequestDelayMs: 1000,
+    maxRetries: 10,
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000 // Keep alive a cada 30 segundos
   });
 
   const processPendingMessages = async () => {
-    for (const { jid, msg } of pendingMessages) {
-      try {
-        await sock.sendMessage(jid, msg);
-      } catch (e) {
-        console.error("❌ Falha ao reenviar mensagem pendente:", e.message);
+    if (pendingMessages.length > 0) {
+      console.log(`📨 Processando ${pendingMessages.length} mensagens pendentes...`);
+      for (const { jid, msg } of pendingMessages) {
+        try {
+          await sock.sendMessage(jid, msg);
+        } catch (e) {
+          console.error("❌ Falha ao reenviar mensagem pendente:", e.message);
+        }
       }
+      pendingMessages = [];
     }
-    pendingMessages = [];
   };
 
   sock.ev.on("connection.update", async (update) => {
@@ -135,6 +179,7 @@ async function iniciarBot(deviceName) {
 
     if (qr && !qrSent) {
       qrSent = true;
+      reconnectAttempts = 0; // Reset na contagem quando QR é gerado
       try {
         const qrBase64 = await QRCode.toDataURL(qr);
         console.log(`\n\n📌 QR CODE PARA CONECTAR (escaneie nos próximos 30s):\n`);
@@ -148,21 +193,37 @@ async function iniciarBot(deviceName) {
     if (connection === "close") {
       const motivo = new Boom(lastDisconnect?.error)?.output?.statusCode;
       console.error(`⚠️ Conexão fechada: ${motivo}`);
+      
+      reconnectAttempts++;
+      
+      // Estratégia de reconexão exponencial
+      const delay = Math.min(RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts - 1), 30000);
 
       if (motivo === DisconnectReason.loggedOut) {
         console.log("❌ Sessão inválida. Limpando e pedindo novo QR...");
-        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        if (fs.existsSync(AUTH_FOLDER)) {
+          fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        }
+        reconnectAttempts = 0;
         setTimeout(() => iniciarBot(deviceName), 3000);
+      } else if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        console.log("🔴 Máximo de tentativas de reconexão atingido. Reiniciando processo...");
+        process.exit(1); // Força reinício completo pelo PM2/Uptimer
       } else {
-        console.log("🔄 Reconectando...");
-        setTimeout(() => iniciarBot(deviceName), 5000);
+        console.log(`🔄 Tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}. Reconectando em ${delay}ms...`);
+        authReady = false;
+        setTimeout(() => iniciarBot(deviceName), delay);
       }
     } else if (connection === "open") {
       console.log(`✅✅✅ BOT CONECTADO COM SUCESSO!`);
+      console.log(`✅ Tentativas de reconexão: ${reconnectAttempts}`);
       console.log(`✅ Grupos antigos DEVEM funcionar normalmente.`);
       authReady = true;
+      reconnectAttempts = 0; // Reset no contador ao conectar
       await processPendingMessages();
       await syncAuthToSupabase(); // salva sessão logo após conectar
+    } else if (connection === "connecting") {
+      console.log("🔄 Conectando...");
     }
   });
 
@@ -172,36 +233,26 @@ async function iniciarBot(deviceName) {
   });
 
   // ===================== SenderKey cache & throttle =====================
-  // Guarda os grupos já inicializados para não tentar sempre (evita lentidão)
   const senderReadyGroups = new Set();
-  // Guarda timestamp da última tentativa por grupo (evita flood de tentativas)
   const senderAttemptAt = new Map();
   const SENDER_COOLDOWN_MS = 60 * 1000; // 60 segundos
 
-  // 🆕 Função melhorada: tenta garantir SenderKey UMA VEZ por grupo e usa cache
   const ensureGroupReady = async (groupId) => {
     if (!groupId || !groupId.endsWith("@g.us")) return true;
 
-    // Se já está pronto, retorna true imediatamente
     if (senderReadyGroups.has(groupId)) return true;
 
-    // Se tentou recentemente, não tenta de novo (apenas retorna false para indicar não pronto)
     const lastAttempt = senderAttemptAt.get(groupId) || 0;
     const now = Date.now();
     if (now - lastAttempt < SENDER_COOLDOWN_MS) {
-      // Evita mensagens repetidas: não enviar aviso ao usuário, só faz fallback
       return false;
     }
 
     senderAttemptAt.set(groupId, now);
 
     try {
-      // Envia mensagem mínima e imediata para forçar SenderKey. Evita conteúdo grande.
       await sock.sendMessage(groupId, { text: "🔐 Inicializando grupo..." });
-      // Se chegou aqui, consideramos SenderKey pronto
       senderReadyGroups.add(groupId);
-      // Limpa o aviso que mandamos (opcional): tenta deletar a mensagem se a API permitir
-      // (comentado para não quebrar caso não tenha id retornado)
       return true;
     } catch (err) {
       console.warn(`⚠️ Falha na inicialização do grupo ${groupId}: ${err.message}`);
@@ -220,35 +271,36 @@ async function iniciarBot(deviceName) {
     ).replace(/[\u200e\u200f\u2068\u2069]/g, "").trim();
     const lowerText = messageText.toLowerCase();
 
-    try { await handleAntiLinkMessage(sock, msg); } catch (err) { console.error("AntiLink:", err); }
+    try { 
+      await handleAntiLinkMessage(sock, msg); 
+    } catch (err) { 
+      console.error("AntiLink:", err); 
+    }
 
     try {
       if (msg.message?.imageMessage && senderJid.endsWith("@g.us")) await handleComprovanteFoto(sock, msg);
       await handleMensagemPix(sock, msg);
 
-      // Se for grupo, garante SenderKey ANTES de processar comandos pesados
       if (senderJid.endsWith("@g.us")) {
         const ready = await ensureGroupReady(senderJid);
         if (!ready) {
-          // fallback: processa comandos leves (texto) mesmo sem SenderKey
-          // para evitar bloquear completamente. Só evita enviar mídia grande.
           console.log(`ℹ️ SenderKey não pronta para ${senderJid}. Processando comandos leves.`);
-          // Se o comando exige enviar mídia grande (ex: tabela com imagens), faça fallback para texto.
           if (lowerText === "@tabela" || ['.t', '.n', '.i', '.s'].includes(lowerText)) {
-            // enviar versão em texto simples (mais leve)
             try {
-              await handleTabela(sock, msg, { fallbackTextOnly: true }); // handler pode aceitar flag opcional
+              await handleTabela(sock, msg, { fallbackTextOnly: true });
             } catch (e) {
-              // se handler não aceitar flag, chamar normalmente (tentativa)
-              try { await handleTabela(sock, msg); } catch (err) { console.error("Tabela fallback erro:", err.message); }
+              try { 
+                await handleTabela(sock, msg); 
+              } catch (err) { 
+                console.error("Tabela fallback erro:", err.message); 
+              }
             }
             return;
           }
-          // Para outros comandos de texto, continua normalmente
         }
       }
 
-      // Comandos (mantidos)
+      // Comandos
       if (lowerText.startsWith(".compra")) await handleCompra2(sock, msg);
       else if (lowerText === "@concorrentes") await handleListar(sock, msg);
       else if (lowerText.startsWith("@remove") || lowerText.startsWith("/remove")) await handleRemove(sock, msg);
@@ -264,7 +316,15 @@ async function iniciarBot(deviceName) {
 
     } catch (err) {
       console.error("❌ Erro ao processar mensagem:", err);
-      pendingMessages.push({ jid: senderJid, msg: { text: "❌ Ocorreu um erro ao processar sua solicitação." } });
+      if (authReady) {
+        try {
+          await sock.sendMessage(senderJid, { text: "❌ Ocorreu um erro ao processar sua solicitação." });
+        } catch (e) {
+          pendingMessages.push({ jid: senderJid, msg: { text: "❌ Ocorreu um erro ao processar sua solicitação." } });
+        }
+      } else {
+        pendingMessages.push({ jid: senderJid, msg: { text: "❌ Ocorreu um erro ao processar sua solicitação." } });
+      }
     }
   };
 
@@ -274,14 +334,16 @@ async function iniciarBot(deviceName) {
     if (msg.key.fromMe) return;
 
     if (!authReady) {
-      // mantém comportamento inicial (fila), porém sem mensagens longas ao usuário
-      pendingMessages.push({ jid: msg.key.remoteJid, msg: { text: "⏳ Bot iniciando, aguarde..." } });
+      pendingMessages.push({ 
+        jid: msg.key.remoteJid, 
+        msg: { text: "⏳ Bot iniciando, aguarde..." } 
+      });
       return;
     }
 
-    // Processa a mensagem imediatamente (não bloqueante)
-    // colocar em micro-tarefa para não travar o loop de eventos
-    processMessage(msg).catch(err => console.error("processMessage catch:", err));
+    process.nextTick(() => {
+      processMessage(msg).catch(err => console.error("processMessage catch:", err));
+    });
   });
 
   sock.ev.on("messages.reaction", async reactions => {
@@ -302,9 +364,21 @@ async function iniciarBot(deviceName) {
 
         try {
           const ppUrl = await sock.profilePictureUrl(participant, "image").catch(() => null);
-          if (ppUrl) await sock.sendMessage(id, { image: { url: ppUrl }, caption: mensagem, mentions: [participant] });
-          else await sock.sendMessage(id, { text: mensagem, mentions: [participant] });
-        } catch (err) { console.error(err); }
+          if (ppUrl) {
+            await sock.sendMessage(id, { 
+              image: { url: ppUrl }, 
+              caption: mensagem, 
+              mentions: [participant] 
+            });
+          } else {
+            await sock.sendMessage(id, { 
+              text: mensagem, 
+              mentions: [participant] 
+            });
+          }
+        } catch (err) { 
+          console.error("Erro ao dar boas-vindas:", err);
+        }
       }
     }
   });
@@ -313,9 +387,74 @@ async function iniciarBot(deviceName) {
 }
 
 // ===================== Inicialização =====================
-iniciarBot("Dispositivo 1");
+setupHealthChecks();
+
+// Função de inicialização com tratamento de erro global
+async function startBot() {
+  try {
+    await iniciarBot("Dispositivo 1");
+  } catch (error) {
+    console.error("❌ Erro crítico ao iniciar bot:", error);
+    console.log("🔄 Tentando reiniciar em 10 segundos...");
+    setTimeout(startBot, 10000);
+  }
+}
+
+// Inicia o bot
+startBot();
 
 // ===================== Servidor HTTP =====================
-const PORT = process.env.PORT || 10000; // Render usa 10000 por padrão
-app.get("/", (_, res) => res.send("✅ TopBot MULTI-DEVICE rodando com sucesso!"));
+const PORT = process.env.PORT || 10000;
+app.get("/", (_, res) => {
+  const status = authReady ? "conectado" : "desconectado";
+  res.send(`
+    <html>
+      <head>
+        <title>TopBot Status</title>
+        <meta http-equiv="refresh" content="30">
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+          .status { padding: 20px; border-radius: 10px; color: white; font-weight: bold; }
+          .connected { background: #28a745; }
+          .disconnected { background: #dc3545; }
+          .info { background: white; padding: 20px; margin-top: 20px; border-radius: 10px; }
+        </style>
+      </head>
+      <body>
+        <h1>🤖 TopBot MULTI-DEVICE</h1>
+        <div class="status ${authReady ? 'connected' : 'disconnected'}">
+          Status: ${authReady ? '✅ CONECTADO' : '❌ DESCONECTADO'}
+        </div>
+        <div class="info">
+          <p><strong>Tentativas de reconexão:</strong> ${reconnectAttempts}</p>
+          <p><strong>Porta:</strong> ${PORT}</p>
+          <p><strong>Última atualização:</strong> ${new Date().toLocaleString()}</p>
+          <p><a href="/health">Ver JSON completo</a></p>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
 app.listen(PORT, () => console.log(`🌐 Servidor HTTP ativo na porta ${PORT}`));
+
+// ===================== Process Handlers =====================
+// Tratamento de sinais para graceful shutdown
+process.on('SIGINT', () => {
+  console.log('🔄 Recebido SIGINT. Encerrando gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('🔄 Recebido SIGTERM. Encerrando gracefully...');
+  process.exit(0);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Exceção não capturada:', error);
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Promise rejeitada não tratada:', reason);
+});
